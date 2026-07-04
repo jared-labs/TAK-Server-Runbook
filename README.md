@@ -1,305 +1,132 @@
-# VMTAK01 — TAK Server (Situational Awareness & CoT Routing)
+# TAK Server: Situational Awareness and CoT Routing
 
-> Runbook for deploying and maintaining a TAK Server instance providing real-time geolocation sharing, mission data sync, and Cursor-on-Target (CoT) routing for ATAK/iTAK/WinTAK clients.
+## Overview
 
----
+This document summarizes a self-hosted Team Awareness Kit (TAK) Server deployment used for real-time location sharing, mission data synchronization, and Cursor-on-Target (CoT) message routing. It is written as a portfolio-friendly architecture note: the emphasis is on system design, certificate-based access, operational tradeoffs, and upgrade strategy rather than day-to-day administration.
 
-## At a Glance
+The deployment demonstrates how a small lab can run mission-oriented coordination tooling with mutual TLS, persistent client enrollment, and a clearly separated messaging/API service architecture.
+
+## Environment
 
 | Field | Value |
 |-------|-------|
-| VM Name | `VMTAK01` |
-| Host Node | Proxmox VE cluster |
-| IP Address | `<vmtak01-ip>` |
-| OS | Ubuntu 22.04 LTS |
+| System | VMTAK01 |
+| Host Node | PVE05 (10.0.0.145) |
+| VMID | 107 |
+| IP Address | 10.0.0.129 |
+| OS | Ubuntu 22.04.3 LTS |
 | vCPU / RAM / Disk | 2 / 8 GB / 50 GB |
-| Java | OpenJDK 17 |
-| TAK Version | **5.7-RELEASE-43** |
-| Key Ports | `8089` (TLS client), `8443` (HTTPS API), `8444` (federation), `8446` (web admin), `6060` (TCP/CoT) |
-| Credentials | Store in password manager — change defaults immediately |
-| Depends On | Proxmox VE, PostgreSQL 15 (local) |
+| Java | OpenJDK 17.0.19 |
+| TAK Version | 5.7-RELEASE-43 |
+| Registered Clients | 39 |
 
-> **Warning:** TAK Server uses mutual TLS (mTLS) for all API and admin access. Without a valid client certificate you cannot access the web UI or API.
+## Tech Stack
 
----
+| Component | Role |
+|-----------|------|
+| TAK Server | Core situational-awareness platform |
+| takserver-messaging | Real-time CoT routing for TAK clients |
+| takserver-api | REST API, mission sync, web admin, federation |
+| PostgreSQL | Local `cot` database |
+| OpenJDK 17 | TAK runtime |
+| mTLS certificates | Client, admin UI, and API authentication |
 
-## Prerequisites
+## Service Architecture
 
-- [ ] Proxmox node with 8 GB RAM available
-- [ ] Ubuntu 22.04 LTS VM provisioned
-- [ ] Java 17 installed (`apt install openjdk-17-jre-headless`)
-- [ ] PostgreSQL 15 installed (the TAK .deb installer will configure it)
-- [ ] `.deb` package downloaded from [tak.gov](https://tak.gov) (login required)
-
----
-
-## 0 — Create the VM in Proxmox
-
-```bash
-qm create <VMID> --name VMTAK01 --memory 8192 --cores 2 \
-  --net0 virtio,bridge=vmbr0 --scsihw virtio-scsi-pci \
-  --scsi0 local-lvm:50
+```text
+Clients (ATAK/iTAK/WinTAK)
+    |
+    |-- Port 8089 (TLS/mTLS) --> takserver-messaging (Netty)
+    |-- Port 6060 (TCP/CoT)  --> takserver-messaging (Netty)
+    |
+    `-- Port 8443 (HTTPS API) --> takserver-api (Tomcat/Spring Boot)
+        Port 8444 (Federation) --> takserver-api
+        Port 8446 (Web Admin)  --> takserver-api
 ```
 
----
+The design separates latency-sensitive message routing from API and administration workflows. TAK clients primarily depend on the messaging plane for live CoT events, while mission data, group management, administration, and federation are handled by the API service.
 
-## 1 — Base OS Prep
+## Network Interfaces
 
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y qemu-guest-agent curl wget openjdk-17-jre-headless
-sudo systemctl enable --now qemu-guest-agent
-sudo hostnamectl set-hostname VMTAK01
-```
+| Port | Purpose |
+|------|---------|
+| 6060 | TCP Cursor-on-Target ingest/routing |
+| 8089 | TLS/mTLS TAK client connectivity |
+| 8443 | HTTPS API |
+| 8444 | Federation |
+| 8446 | Web administration |
 
----
+The server sits at 10.0.0.129 inside the 10.0.0.0/24 lab network. Internal addressing is intentionally retained here because it shows the real topology without exposing routable infrastructure.
 
-## 2 — Install TAK Server
+## Authentication Model
 
-```bash
-# Upload the .deb to the VM
-scp takserver_5.7-RELEASE43_all.deb <user>@<vmtak01-ip>:/tmp/
+TAK Server uses mutual TLS for both API access and the web administration interface. Administrative and user identities are represented by certificate bundles rather than reusable web passwords.
 
-# Verify checksum
-md5sum /tmp/takserver_5.7-RELEASE43_all.deb
-# Expected: 937cce47e94822090635d11e0ed0c59c
+| Item | Location / Pattern | Secret Handling |
+|------|--------------------|-----------------|
+| Admin certificate bundle | Server-side TAK cert store and local admin workstation copy | `<stored in password manager>` |
+| Truststore | Local workstation secret storage | `<stored in password manager>` |
+| User certificate bundle | Per-client enrollment material | `<stored in password manager>` |
+| SSH account | Local operating-system account | `<stored in password manager>` |
 
-# Install
-sudo apt install -y /tmp/takserver_5.7-RELEASE43_all.deb
-```
+The useful design pattern is that certificate material is treated as an identity artifact, not as a casual file attachment. Local copies live in controlled secret storage, and operational passwords are not embedded in scripts or documentation.
 
-The installer will:
-- Unpack JARs and WAR file to `/opt/tak/`
-- Install and configure PostgreSQL 15
-- Create the `cot` database
-- Run `SchemaManager.jar` to apply the schema
-- Set up the systemd init script
+## API Surface
 
----
+Base API URL: `https://10.0.0.129:8443`
 
-## 3 — Generate Certificates
+| Endpoint | Purpose |
+|----------|---------|
+| `/Marti/api/version` | Server version metadata |
+| `/Marti/api/clientEndPoints` | Connected and registered clients |
+| `/Marti/api/contacts/all` | Contact listing |
+| `/Marti/api/missions` | Mission list |
+| `/Marti/api/groups/all` | Group list |
+| `/Marti/api/cot/xml` | CoT event submission |
 
-```bash
-cd /opt/tak/certs
+These endpoints are useful for health checks, inventory capture, and integration work, but access requires the appropriate client certificate.
 
-# Edit certificate metadata
-sudo nano cert-metadata.sh
-# Set: COUNTRY, STATE, CITY, ORGANIZATION, ORGANIZATIONAL_UNIT
+## Design Decisions
 
-# Generate the CA
-sudo ./makeRootCa.sh
+- **mTLS over shared web credentials:** TAK's certificate-first model fits the system's purpose: authenticated clients need to exchange trusted real-time location and mission data.
+- **Single VM deployment:** A single virtual machine is simple to snapshot, back up, and upgrade in a home-lab environment while still reflecting production-style service boundaries inside TAK.
+- **Persistent certificate authority:** Server upgrades preserve the CA and client certificates, avoiding unnecessary client re-enrollment.
+- **PostgreSQL local to the VM:** Keeping the TAK database local reduces cross-service coupling and makes snapshot-based rollback practical.
+- **Explicit port mapping:** Each exposed port has a distinct operational purpose, which makes firewalling and troubleshooting easier.
 
-# Generate server cert
-sudo ./makeCert.sh server takserver
+## Upgrade Procedure
 
-# Generate admin cert
-sudo ./makeCert.sh client admin
+TAK Server supports in-place upgrades through the official Debian package. The important engineering concern is preserving state: certificates, `CoreConfig.xml`, database contents, user accounts, missions, and enrolled clients should survive the package replacement.
 
-# Generate user certs (one per ATAK device)
-sudo ./makeCert.sh client <username>
-```
+High-level upgrade flow:
 
-> **Note:** Store all `.p12` files and their passwords in your password manager. The default cert password is set in `cert-metadata.sh`.
+1. Take a hypervisor snapshot before making changes.
+2. Back up TAK certificates and `CoreConfig.xml`.
+3. Verify the downloaded TAK package hash against the vendor-provided value.
+4. Stop TAK services, install the package, reload service definitions, and start TAK again.
+5. Allow for Java/Spring Boot startup time before checking health.
+6. Validate API availability, web admin availability, and client connectivity.
+7. Remove the snapshot only after the upgraded system has been stable.
 
----
-
-## 4 — Configure TAK Server
-
-Edit `/opt/tak/CoreConfig.xml` to configure inputs, auth, and federation.
-
-Key sections:
-- `<network>` — Define client input ports and protocols
-- `<auth>` — Certificate-based auth settings
-- `<federation>` — Cross-server federation config
-- `<repository>` — Database connection settings
-
-```bash
-sudo nano /opt/tak/CoreConfig.xml
-```
-
-> **Note:** CoreConfig.xml is the single source of truth for all server settings.
-
----
-
-## 5 — Start & Validate
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl start takserver
-sudo systemctl enable takserver
-
-# TAK Server takes 60-90 seconds to fully start (Java/Spring Boot)
-sleep 90
-
-# Verify ports are listening
-ss -tlnp | grep -E "8443|8446|8089|8444|6060"
-
-# Register admin user
-sudo java -jar /opt/tak/utils/UserManager.jar certmod -A /opt/tak/certs/files/admin.pem
-```
-
-- [ ] Port 8089 (TLS client) listening
-- [ ] Port 8443 (HTTPS API) listening
-- [ ] Port 8444 (Federation) listening
-- [ ] Port 8446 (Web Admin) listening
-- [ ] Port 6060 (TCP/CoT) listening
-- [ ] Web UI accessible at `https://<vmtak01-ip>:8446` with admin cert loaded in browser
-
----
-
-## 6 — Client Certificate Import (macOS)
-
-macOS Keychain Access GUI may fail with `OSStatus -26276` when importing `.p12` files generated by OpenSSL 3.x (which defaults to AES-256-CBC encryption that Keychain doesn't support).
-
-**Fix — use the CLI:**
-
-```bash
-security import admin.p12 -P <cert-password>
-```
-
-**Or re-export with legacy encryption:**
-
-```bash
-# On the TAK server
-sudo openssl pkcs12 -in /opt/tak/certs/files/admin.p12 \
-  -passin pass:<cert-password> -nodes -legacy -out /tmp/admin.pem
-
-sudo openssl pkcs12 -export -in /tmp/admin.pem \
-  -passout pass:<cert-password> -legacy -out /tmp/admin-legacy.p12
-```
-
----
-
-## 7 — Upgrading TAK Server (In-Place)
-
-TAK Server supports in-place upgrades via the `.deb` package. The process preserves certificates, CoreConfig.xml, database, user accounts, missions, and enrolled clients.
-
-### Procedure
-
-```bash
-# 1. Snapshot the VM on Proxmox (safety net)
-qm snapshot <VMID> preupgrade --description "Before TAK Server upgrade"
-
-# 2. Backup certs and config
-sudo mkdir -p /opt/tak-backup
-sudo cp -a /opt/tak/certs /opt/tak-backup/
-sudo cp /opt/tak/CoreConfig.xml /opt/tak-backup/
-
-# 3. Upload new .deb and verify checksum
-scp takserver_X.Y-RELEASENN_all.deb <user>@<vmtak01-ip>:/tmp/
-md5sum /tmp/takserver_*.deb
-
-# 4. Stop, install, start
-sudo systemctl stop takserver
-sudo apt install -y /tmp/takserver_*.deb
-sudo systemctl daemon-reload
-sudo systemctl start takserver
-
-# 5. Wait ~90s for Java startup, verify ports
-sleep 90
-ss -tlnp | grep -E "8443|8446|8089"
-```
-
-### What the installer preserves automatically
-
-- Certificates and keystores (`/opt/tak/certs/`)
-- `CoreConfig.xml` (server configuration)
-- PostgreSQL database (schema migrated by `SchemaManager.jar`)
-- Retention policy and mission archive configs
-- All enrolled client records
-
-### Rollback
-
-```bash
-# Restore from Proxmox snapshot
-qm rollback <VMID> preupgrade
-```
-
-### Post-upgrade
-
-- Verify web admin UI loads at `https://<vmtak01-ip>:8446`
-- Confirm clients can reconnect (certs are unchanged)
-- Check logs: `sudo tail -f /opt/tak/logs/takserver-api.log`
-- Remove snapshot after confirming stability: `qm delsnapshot <VMID> preupgrade`
-
-> **Note:** Client certificates don't need re-issuing after server upgrades — the CA stays the same. All devices reconnect automatically.
-
----
+Rollback is snapshot-based. That keeps the recovery model simple and avoids partial manual restoration of Java packages, database schema state, or certificate files.
 
 ## Upgrade History
 
 | Date | From | To | Notes |
 |------|------|----|-------|
-| 2026-07-02 | 4.10-RELEASE-50 | 5.7-RELEASE-43 | Clean upgrade. 12 schema migrations applied. All certs preserved. |
+| 2026-07-02 | 4.10-RELEASE-50 | 5.7-RELEASE-43 | Clean in-place upgrade. Schema migrations applied and client certificates preserved. |
 
----
+## Quirks and Gotchas
 
-## Troubleshooting
+- TAK Server can take 60-90 seconds to fully start because of Java and Spring Boot cold-start behavior.
+- The legacy init wrapper can make service status look unusual even when the TAK components are running correctly.
+- PKCS#12 files generated by newer OpenSSL defaults may fail to import through the macOS Keychain GUI; legacy-compatible export settings or CLI import avoid that issue.
+- `CoreConfig.xml` is the single source of truth for server configuration.
+- Client certificates do not need to be reissued after normal server upgrades as long as the CA is preserved.
+- Internet-facing TAK client ports can attract scanner noise, so firewall policy should match the real trust boundary.
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| macOS `OSStatus -26276` on .p12 import | OpenSSL 3.x encryption format | Re-export with `-legacy` flag, or use `security import` CLI |
-| Ports not listening after start | Java startup takes 60-90s | Wait and recheck `ss -tlnp` |
-| `takserver-config.service not found` | Stale systemd unit after upgrade | `systemctl daemon-reload` then restart |
-| SSL handshake errors in messaging log | Internet scanners probing TLS ports | Normal noise; firewall to local network only |
-| Client can't connect | Client cert expired or revoked | Re-enroll via web admin or `UserManager.jar` |
+## What This Demonstrates
 
----
+This deployment shows practical ownership of a certificate-authenticated coordination platform: service decomposition, mTLS identity, upgrade planning, rollback safety, and the tradeoffs of running specialized mission software in a virtualized lab.
 
-## Quick Reference
-
-```bash
-# Start/stop/restart
-sudo systemctl restart takserver
-
-# View logs
-sudo tail -f /opt/tak/logs/takserver-messaging.log
-sudo tail -f /opt/tak/logs/takserver-api.log
-
-# Check version
-grep version /opt/tak/CoreConfig.xml
-
-# List connected clients (with admin cert)
-curl -k --cert-type P12 --cert admin.p12:<cert-password> \
-  https://<vmtak01-ip>:8443/Marti/api/clientEndPoints
-
-# Certificate management
-sudo java -jar /opt/tak/utils/UserManager.jar certmod -A /opt/tak/certs/files/<user>.pem
-```
-
----
-
-## Service Architecture
-
-```
-Clients (ATAK/iTAK/WinTAK)
-    │
-    ├── Port 8089 (TLS/mTLS) ──→ takserver-messaging (Netty)
-    ├── Port 6060 (TCP/CoT)  ──→ takserver-messaging (Netty)
-    │
-    └── Port 8443 (HTTPS API) ─→ takserver-api (Tomcat/Spring Boot)
-         Port 8444 (Federation) ─→ takserver-api
-         Port 8446 (Web Admin)  ─→ takserver-api
-```
-
-- **takserver-messaging**: Real-time CoT routing between clients (Netty)
-- **takserver-api**: REST API, web admin UI, mission sync, enterprise sync (Tomcat)
-- **takserver-plugins**: Plugin execution engine
-- **takserver-retention**: Data retention and cleanup
-- **PostgreSQL 15**: `cot` database on localhost
-
----
-
-## Quirks & Gotchas
-
-- TAK Server takes 60-90 seconds to fully start (Java/Spring Boot cold start)
-- The init script (`/etc/init.d/takserver`) is a legacy sysvinit wrapper — `systemctl` works but shows `active (exited)` rather than `active (running)`
-- `.p12` files generated by OpenSSL 3.x default to AES-256-CBC which macOS Keychain GUI can't import — always use `-legacy` flag or `security import` CLI
-- Exposed TLS ports attract constant scanner traffic — firewall to VPN/local network only
-- `CoreConfig.xml` is the single source of truth for all server configuration
-- Client certs don't need re-issuing after server upgrades — the CA stays the same
-- Download requires a [tak.gov](https://tak.gov) account (free registration)
-
----
-
-*Last updated: 2026-07-02*
+*Sanitized for public portfolio use. Last updated from source runbook: 2026-07-02.*
